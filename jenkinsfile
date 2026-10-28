@@ -1,0 +1,70 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_BUILDKIT = '1'   // --secret 依赖 BuildKit
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/guoqj002/catest.git'
+            }
+        }
+
+        stage('Build with corp-root & local-CA01') {
+            steps {
+                // 同时绑定两个 Secret file 凭据
+                withCredentials([
+                    file(credentialsId: 'corp-root',   variable: 'CORP_ROOT_FILE'),
+                    file(credentialsId: 'local-CA01',  variable: 'LOCAL_CA01_FILE')
+                ]) {
+                    sh '''
+                        docker build \
+                          --secret id=corp_root,src="${CORP_ROOT_FILE}" \
+                          --secret id=local_ca01,src="${LOCAL_CA01_FILE}" \
+                          -t my-app:trust-ca .
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Trust Store') {
+            steps {
+                sh '''
+                    set -e
+                    docker run --rm my-app:trust-ca bash -c '
+                        set -e
+                        echo "--- /usr/local/share/ca-certificates/ ---"
+                        ls -la /usr/local/share/ca-certificates/
+
+                        echo "--- /etc/ssl/certs/ 中的符号链接 ---"
+                        find /etc/ssl/certs -maxdepth 1 -type l \
+                             \\( -lname "*corp-root*" -o -lname "*local-CA01*" \\) \
+                             -printf "%f -> %l\\n"
+
+                        echo "--- ca-certificates.crt 中证书总数 ---"
+                        grep -c "BEGIN CERTIFICATE" /etc/ssl/certs/ca-certificates.crt
+
+                        echo "--- 逐个确认两个 CA 都在信任库中 ---"
+                        for name in corp-root local-CA01; do
+                            if find /etc/ssl/certs -maxdepth 1 -type l -lname "*${name}*" | grep -q .; then
+                                echo "✅ ${name}"
+                            else
+                                echo "❌ ${name} 缺失"
+                                exit 1
+                            fi
+                        done
+                    '
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker rmi my-app:trust-ca || true'
+        }
+    }
+}
